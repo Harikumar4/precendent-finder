@@ -8,6 +8,11 @@ import chromadb
 from chromadb.utils import embedding_functions
 import pandas as pd
 from pathlib import Path
+from groq import Groq
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Set page config
 st.set_page_config(
@@ -49,23 +54,37 @@ if 'chroma_client' not in st.session_state:
     st.session_state.chroma_client = None
     st.session_state.collection = None
     st.session_state.initialized = False
+    st.session_state.cases_loaded = False
 
 # Initialize or load the ChromaDB collection
 def initialize_chroma():
     if not st.session_state.initialized:
         try:
-            st.session_state.chroma_client = chromadb.Client()
-            try:
-                st.session_state.chroma_client.delete_collection(name="precedent_finder")
-            except:
-                pass  # Ignore if collection doesn't exist
+            # Use PersistentClient to save embeddings to disk
+            db_path = "./chroma_db"
+            st.session_state.chroma_client = chromadb.PersistentClient(path=db_path)
             
-            st.session_state.collection = st.session_state.chroma_client.create_collection(
-                name="precedent_finder",
-                embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
-                    model_name="all-MiniLM-L6-v2"
+            # Check if collection already exists
+            try:
+                st.session_state.collection = st.session_state.chroma_client.get_collection(
+                    name="precedent_finder",
+                    embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
+                        model_name="all-MiniLM-L6-v2"
+                    )
                 )
-            )
+                # Collection exists, check if it has data
+                count = st.session_state.collection.count()
+                if count > 0:
+                    st.session_state.cases_loaded = True
+            except:
+                # Collection doesn't exist, create it
+                st.session_state.collection = st.session_state.chroma_client.create_collection(
+                    name="precedent_finder",
+                    embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
+                        model_name="all-MiniLM-L6-v2"
+                    )
+                )
+            
             st.session_state.initialized = True
             return True
         except Exception as e:
@@ -138,6 +157,53 @@ def ingest_case(pdf_path, case_id):
         st.error(f"Error ingesting {case_id}: {str(e)}")
         return 0, {}
 
+# Function to load cases from cases/ folder
+def load_cases_from_folder(folder_path="cases", max_cases=10):
+    """Load the first N PDF cases from the cases folder into ChromaDB"""
+    if not st.session_state.initialized:
+        return False
+    
+    # Check if collection already has data
+    try:
+        count = st.session_state.collection.count()
+        if count > 0:
+            st.session_state.cases_loaded = True
+            return True
+    except:
+        pass
+    
+    if st.session_state.cases_loaded:
+        return True
+    
+    try:
+        cases_path = Path(folder_path)
+        if not cases_path.exists():
+            st.error(f"Cases folder '{folder_path}' not found!")
+            return False
+        
+        # Get all PDF files, sorted by name
+        pdf_files = sorted([f for f in cases_path.glob("*.pdf")])[:max_cases]
+        
+        if not pdf_files:
+            st.warning(f"No PDF files found in '{folder_path}' folder!")
+            return False
+        
+        total_chunks = 0
+        progress_bar = st.progress(0)
+        total_files = len(pdf_files)
+        
+        for idx, pdf_file in enumerate(pdf_files):
+            case_id = pdf_file.stem  # e.g., "2024-1-case-1"
+            chunks, _ = ingest_case(str(pdf_file), case_id)
+            total_chunks += chunks
+            progress_bar.progress((idx + 1) / total_files)
+        
+        st.session_state.cases_loaded = True
+        return True
+    except Exception as e:
+        st.error(f"Error loading cases: {str(e)}")
+        return False
+
 # Function to search cases
 def search_cases(query, n_results=8):  # Increased default results
     try:
@@ -159,6 +225,77 @@ def search_cases(query, n_results=8):  # Increased default results
         st.error(f"Search error: {str(e)}")
         return None
 
+# Function to generate answer using Groq API
+def generate_answer_with_groq(query, chunks, metadatas, api_key, model="llama-3.1-70b-versatile"):
+    """
+    Generate an answer using Groq API based on the query and relevant chunks.
+    
+    Args:
+        query: User's query
+        chunks: List of relevant text chunks
+        metadatas: List of metadata for each chunk
+        api_key: Groq API key
+        model: Groq model to use (default: llama-3.1-70b-versatile)
+    
+    Returns:
+        Generated answer string or None if error
+    """
+    try:
+        # Initialize Groq client
+        client = Groq(api_key=api_key)
+        
+        # Format chunks with their metadata for context
+        context_parts = []
+        for i, (chunk, metadata) in enumerate(zip(chunks, metadatas), 1):
+            context_info = f"[Source {i}]"
+            if 'title' in metadata:
+                context_info += f" Case: {metadata['title']}"
+            if 'case_id' in metadata:
+                context_info += f" (ID: {metadata['case_id']})"
+            if 'year' in metadata:
+                context_info += f" Year: {metadata['year']}"
+            context_info += f"\n{chunk}\n"
+            context_parts.append(context_info)
+        
+        # Combine all context
+        context = "\n\n".join(context_parts)
+        
+        # Create the prompt
+        system_prompt = """You are a legal research assistant specializing in Indian case law. 
+Your task is to provide clear, accurate, and well-structured answers based on the provided legal case excerpts.
+Use the source information to support your answer and cite specific cases when relevant.
+If the provided context doesn't fully answer the question, state what information is available and what is missing."""
+        
+        user_prompt = f"""Based on the following legal case excerpts, please answer the query: "{query}"
+
+Legal Case Excerpts:
+{context}
+
+Please provide a comprehensive answer that:
+1. Directly addresses the query
+2. References specific cases and excerpts when relevant
+3. Provides a clear, structured response
+4. Cites the source information (Source 1, Source 2, etc.) when making specific points
+
+Answer:"""
+        
+        # Call Groq API
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,  # Lower temperature for more factual responses
+            max_tokens=2000
+        )
+        
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        st.error(f"Error generating answer with Groq: {str(e)}")
+        return None
+
 # Main app
 def main():
     st.title("⚖️ Legal Precedent Finder")
@@ -168,67 +305,96 @@ def main():
     if not initialize_chroma():
         st.error("Failed to initialize the database. Please check the logs.")
         return
+    
+    # Load cases from cases/ folder automatically (only if not already loaded)
+    if not st.session_state.cases_loaded:
+        with st.spinner("Creating embeddings from cases/ folder (this only happens once)..."):
+            if load_cases_from_folder("cases", max_cases=10):
+                count = st.session_state.collection.count()
+                st.success(f"✅ Loaded 10 cases from cases/ folder ({count} chunks total)")
+            else:
+                st.error("Failed to load cases. Please check the cases/ folder.")
+    else:
+        # Show info about existing embeddings
+        count = st.session_state.collection.count()
+        st.success(f"✅ Using existing embeddings ({count} chunks)")
 
-    # Sidebar for file upload
-    with st.sidebar:
-        st.header("📂 Upload Case Files")
-        uploaded_files = st.file_uploader(
-            "Upload PDF case files", 
-            type="pdf",
-            accept_multiple_files=True
+    # Groq API Configuration (always enabled)
+    # Try to get API key from environment first
+    env_api_key = os.environ.get("GROQ_API_KEY")
+    
+    if env_api_key:
+        st.session_state.groq_api_key = env_api_key
+    else:
+        # Store in session state for access in main function
+        if 'groq_api_key' not in st.session_state:
+            st.session_state.groq_api_key = None
+        
+        # API key input at the top
+        groq_api_key_input = st.text_input(
+            "🔑 Groq API Key",
+            type="password",
+            value=st.session_state.groq_api_key if st.session_state.groq_api_key else "",
+            help="Enter your Groq API key. Get one at https://console.groq.com/ or set GROQ_API_KEY environment variable"
         )
         
-        if uploaded_files:
-            progress_bar = st.progress(0)
-            total_files = len(uploaded_files)
-            processed = 0
-            total_chunks = 0
-            
-            for i, uploaded_file in enumerate(uploaded_files):
-                case_id = f"uploaded_{i}"
-                file_path = os.path.join("temp", uploaded_file.name)
-                os.makedirs("temp", exist_ok=True)
-                
-                with open(file_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                
-                chunks, _ = ingest_case(file_path, case_id)
-                total_chunks += chunks
-                processed += 1
-                progress_bar.progress(processed / total_files)
-                
-                # Clean up
-                os.remove(file_path)
-            
-            if total_chunks > 0:
-                st.success(f"Successfully processed {processed} file(s) with {total_chunks} chunks")
-            else:
-                st.warning("No content was processed. Check if the PDFs contain extractable text.")
-        
-        st.markdown("---")
-        st.markdown("### About")
-        st.markdown("""
-        This application helps you search through legal precedents using semantic search.
-        Upload PDF case files and search using natural language queries.
-        """)
+        if groq_api_key_input:
+            st.session_state.groq_api_key = groq_api_key_input
+    
+    # Fixed settings
+    groq_model = "llama-3.1-8b-instant"  # Always use this model
+    chunks_for_answer = 5  # Always use top 5 chunks
 
     # Main search interface
     st.markdown("### 🔍 Search Legal Precedents")
     query = st.text_area(
-        "Enter your legal query (e.g., 'cases about copyright infringement'):",
-        height=100
+        "Enter your legal query:",
+        height=100,
+        placeholder="e.g., 'cases about copyright infringement' or 'trivial errors in recruitment applications'"
     )
     
-    n_results = st.slider("Number of results to show", 1, 20, 5)
+    # Fixed settings
+    groq_model = "llama-3.1-8b-instant"  # Always use this model
+    chunks_for_answer = 5  # Always use top 5 chunks
     
     if st.button("Search", type="primary") and query:
         with st.spinner("Searching through legal precedents..."):
             try:
-                results = search_cases(query, n_results)
+                # Get top 5 chunks for Groq
+                results = search_cases(query, n_results=5)
                 
                 if results and 'documents' in results and results['documents']:
                     total_results = len(results['documents'][0])
-                    st.subheader(f"📄 Search Results (showing {min(8, total_results)} of {total_results} matches)")
+                    
+                    # Get Groq API key from session state or environment
+                    groq_api_key = st.session_state.get('groq_api_key') or os.environ.get("GROQ_API_KEY")
+                    
+                    # Generate AI answer using Groq (always enabled)
+                    ai_answer = None
+                    if groq_api_key:
+                        # Use top 5 chunks for answer generation
+                        chunks_for_ai = results['documents'][0][:5]
+                        metadatas_for_ai = results['metadatas'][0][:5]
+                        
+                        with st.spinner(f"🤖 Generating AI answer using {groq_model}..."):
+                            ai_answer = generate_answer_with_groq(
+                                query, 
+                                chunks_for_ai, 
+                                metadatas_for_ai,
+                                groq_api_key,
+                                groq_model
+                            )
+                    else:
+                        st.warning("⚠️ Groq API key not found. Please set GROQ_API_KEY environment variable or enter it in the sidebar.")
+                    
+                    # Display AI answer if available
+                    if ai_answer:
+                        st.markdown("---")
+                        st.markdown(ai_answer)
+                        st.markdown("---")
+                    
+                    # Display search results (top 5 chunks)
+                    st.subheader(f"📄 Source Chunks (Top 5)")
                     
                     for i, (doc, metadata, dist) in enumerate(zip(
                         results['documents'][0],
@@ -241,7 +407,7 @@ def main():
                             relevance_color = "green" if relevance_score > 0.7 else "orange" if relevance_score > 0.4 else "red"
                             
                             st.markdown(f"""
-                                ### 📄 Result {i} 
+                                ### 📄 Chunk {i} 
                                 <span style="color: {relevance_color}; font-size: 0.8em;">
                                     Relevance: {relevance_score:.0%}
                                 </span>
@@ -270,7 +436,7 @@ def main():
                             
                             st.markdown("---")
                 else:
-                    st.warning("No results found. Try a different query or upload more case files.")
+                    st.warning("No results found. Make sure cases are loaded in the database.")
                     
             except Exception as e:
                 st.error(f"An error occurred during search: {str(e)}")

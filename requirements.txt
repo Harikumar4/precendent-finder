@@ -33,3 +33,6 @@ hnswlib==0.8.0
 # For API
 fastapi==0.110.2
 uvicorn==0.27.1
+
+# For Groq AI Integration
+groq==0.4.1
